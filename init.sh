@@ -3,15 +3,28 @@ set -euo pipefail
 
 # ============================================
 # Terraform Project Bootstrap Script
-# 用法: ./init.sh <project_name> <gcp_project_id> <github_owner> <github_repo> [region] [sa_email]
+#
+# 用法:
+#   ./init.sh <project_name> <gcp_project_id> <github_owner> <github_repo> [region] [sa_email]
 #
 # 範例:
-#   ./init.sh atlas-p6 my-gcp-project my-org my-repo asia-east1
+#   ./init.sh atlas-p6 my-gcp-project-id my-org atlas-p6-repo asia-east1
+#
+# 功能:
+#   1. 檢查/建立 GitHub 2nd-gen Connection(需要人工完成 OAuth 授權)
+#   2. 檢查/註冊 Repository
+#   3. 建立 Terraform project 資料夾結構(backend.tf / provider.tf / main.tf / variables.tf / outputs.tf)
+#   4. 建立 GCS bucket 作為 terraform state backend
+#   5. 建立 Cloud Build Plan Trigger(PR 觸發)
+#   6. 建立 Cloud Build Apply Trigger(merge 後觸發,需人工核准)
 # ============================================
 
+# --------------------------------------------
+# 0. 參數檢查與初始化
+# --------------------------------------------
 if [ $# -lt 4 ]; then
   echo "用法: $0 <project_name> <gcp_project_id> <github_owner> <github_repo> [region] [sa_email]"
-  echo "範例: $0 atlas-p6 my-gcp-project my-org my-repo asia-east1"
+  echo "範例: $0 atlas-p6 my-gcp-project-id my-org atlas-p6-repo asia-east1"
   exit 1
 fi
 
@@ -22,65 +35,143 @@ GITHUB_REPO="$4"
 REGION="${5:-asia-east1}"
 SA_EMAIL="${6:-cloud-build-sa-tester@${GCP_PROJECT_ID}.iam.gserviceaccount.com}"
 
+# 防呆:確認所有必要變數都不是空字串
+for var_name in PROJECT_NAME GCP_PROJECT_ID GITHUB_OWNER GITHUB_REPO REGION SA_EMAIL; do
+  var_value="${!var_name}"
+  if [ -z "${var_value}" ]; then
+    echo "錯誤: 變數 ${var_name} 為空,無法繼續執行"
+    exit 1
+  fi
+done
+
 BUCKET_NAME="${GCP_PROJECT_ID}-tf-state"
 STATE_PREFIX="${PROJECT_NAME}"
 CONNECTION_NAME="${GITHUB_OWNER}-connection"
 REMOTE_URI="https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git"
+REPOSITORY_ID="projects/${GCP_PROJECT_ID}/locations/${REGION}/connections/${CONNECTION_NAME}/repositories/${GITHUB_REPO}"
 
 echo "=========================================="
 echo "Terraform Project Bootstrap"
-echo "  Project Name : ${PROJECT_NAME}"
-echo "  GCP Project  : ${GCP_PROJECT_ID}"
-echo "  GitHub Repo  : ${GITHUB_OWNER}/${GITHUB_REPO}"
-echo "  Region       : ${REGION}"
+echo "  Project Name      : ${PROJECT_NAME}"
+echo "  GCP Project ID    : ${GCP_PROJECT_ID}"
+echo "  GitHub Repo       : ${GITHUB_OWNER}/${GITHUB_REPO}"
+echo "  Region            : ${REGION}"
+echo "  Service Account   : ${SA_EMAIL}"
+echo "  State Bucket      : ${BUCKET_NAME}"
+echo "  Connection Name   : ${CONNECTION_NAME}"
 echo "=========================================="
 
-if [ -d "${PROJECT_NAME}" ]; then
-  echo "錯誤:資料夾 ${PROJECT_NAME} 已經存在"
+# --------------------------------------------
+# 前置檢查
+# --------------------------------------------
+# if [ -d "${PROJECT_NAME}" ]; then
+#   echo "錯誤: 資料夾 ${PROJECT_NAME} 已經存在,請確認後手動處理"
+#   exit 1
+# fi
+
+if ! command -v gcloud &>/dev/null; then
+  echo "錯誤: 找不到 gcloud CLI,請先安裝 Google Cloud SDK"
   exit 1
 fi
 
-if ! gcloud auth list --filter="status:ACTIVE" --format="value(account)" | grep -q .; then
-  echo "錯誤:尚未登入 gcloud,請先執行 gcloud auth login"
+if ! command -v gsutil &>/dev/null; then
+  echo "錯誤: 找不到 gsutil,請確認 Google Cloud SDK 安裝完整"
   exit 1
 fi
 
-# ============================================
-# 步驟 1: 檢查 / 建立 GitHub Connection(這一步可能需要手動介入)
-# ============================================
+ACTIVE_ACCOUNT=$(gcloud auth list --filter="status:ACTIVE" --format="value(account)" 2>/dev/null || true)
+if [ -z "${ACTIVE_ACCOUNT}" ]; then
+  echo "錯誤: 尚未登入 gcloud,請先執行: gcloud auth login"
+  exit 1
+fi
+echo ""
+echo "目前登入帳號: ${ACTIVE_ACCOUNT}"
+
+# 確認可以存取這個 GCP project
+if ! gcloud projects describe "${GCP_PROJECT_ID}" &>/dev/null; then
+  echo "錯誤: 無法存取 GCP project '${GCP_PROJECT_ID}',請確認 project ID 正確且你有權限"
+  exit 1
+fi
+
+# --------------------------------------------
+# 步驟 1: 檢查 / 建立 GitHub Connection
+# --------------------------------------------
 echo ""
 echo "[1/7] 檢查 GitHub Connection: ${CONNECTION_NAME}..."
 
+CONNECTION_EXISTS=false
 if gcloud builds connections describe "${CONNECTION_NAME}" \
     --region="${REGION}" \
     --project="${GCP_PROJECT_ID}" &>/dev/null; then
-  echo "  → Connection 已存在,略過"
-else
-  echo "  → Connection 不存在,需要先建立"
+  CONNECTION_EXISTS=true
+fi
+
+if [ "${CONNECTION_EXISTS}" = false ]; then
+  echo "  → Connection 不存在,建立中(尚未授權狀態)..."
+  gcloud builds connections create github \
+    "${CONNECTION_NAME}" \
+    --region="${REGION}" \
+    --project="${GCP_PROJECT_ID}"
+fi
+
+echo "  檢查授權狀態..."
+
+INSTALL_STATE=$(gcloud builds connections describe "${CONNECTION_NAME}" \
+  --region="${REGION}" \
+  --project="${GCP_PROJECT_ID}" \
+  --format="value(installationState.stage)" 2>/dev/null || echo "UNKNOWN")
+
+if [ "${INSTALL_STATE}" != "COMPLETE" ]; then
   echo ""
-  echo "  請前往以下網址完成 GitHub 授權連接:"
+  echo "  ⚠ 尚未完成 GitHub App 授權(目前狀態: ${INSTALL_STATE})"
+  echo ""
+  echo "  請前往以下網址完成授權:"
   echo "  https://console.cloud.google.com/cloud-build/repositories/2nd-gen?project=${GCP_PROJECT_ID}"
   echo ""
   echo "  步驟:"
-  echo "    1. 點選 'Create host connection'"
-  echo "    2. 選擇 GitHub,並命名為: ${CONNECTION_NAME}"
-  echo "    3. 完成 GitHub App 授權(授權存取 ${GITHUB_OWNER} 這個 org/帳號)"
+  echo "    1. 找到 connection: ${CONNECTION_NAME}"
+  echo "    2. 完成 GitHub App 安裝/授權流程"
+  echo "    3. 確認授權存取 ${GITHUB_OWNER} 這個 org/帳號下的 repository"
   echo ""
-  read -p "  完成後,請按 Enter 繼續..." _
+  echo "  等待授權完成中(每 10 秒檢查一次,最多等待 10 分鐘)..."
 
-  # 再次確認 connection 是否真的建立成功
-  if ! gcloud builds connections describe "${CONNECTION_NAME}" \
+  MAX_WAIT=60
+  COUNT=0
+
+  while [ "${INSTALL_STATE}" != "COMPLETE" ]; do
+    if [ "${COUNT}" -ge "${MAX_WAIT}" ]; then
+      echo ""
+      echo "  錯誤: 等待逾時,授權仍未完成(目前狀態: ${INSTALL_STATE})"
+      echo "  請完成授權後,重新執行此腳本"
+      exit 1
+    fi
+
+    sleep 10
+    COUNT=$((COUNT + 1))
+
+    SET_RESULT=$(gcloud builds connections describe "${CONNECTION_NAME}" \
       --region="${REGION}" \
-      --project="${GCP_PROJECT_ID}" &>/dev/null; then
-    echo "  錯誤:仍然找不到 connection '${CONNECTION_NAME}',請確認是否命名一致,或重新執行此腳本"
-    exit 1
-  fi
-  echo "  → Connection 確認建立完成"
+      --project="${GCP_PROJECT_ID}" \
+      --format="value(installationState.stage)" 2>&1) || true
+
+    if [ -z "${SET_RESULT}" ]; then
+      INSTALL_STATE="UNKNOWN"
+    else
+      INSTALL_STATE="${SET_RESULT}"
+    fi
+
+    echo "  ...仍在等待(狀態: ${INSTALL_STATE}, 已等待 $((COUNT * 10)) 秒)"
+  done
+
+  echo ""
+  echo "  ✓ 授權已完成!"
+else
+  echo "  → Connection 已完成授權,略過"
 fi
 
-# ============================================
+# --------------------------------------------
 # 步驟 2: 檢查 / 註冊 Repository
-# ============================================
+# --------------------------------------------
 echo ""
 echo "[2/7] 檢查 / 註冊 Repository: ${GITHUB_REPO}..."
 
@@ -98,32 +189,31 @@ else
   echo "  → Repository 註冊完成"
 fi
 
-REPOSITORY_ID="projects/${GCP_PROJECT_ID}/locations/${REGION}/connections/${CONNECTION_NAME}/repositories/${GITHUB_REPO}"
-
-# ============================================
+# --------------------------------------------
 # 步驟 3: 建立資料夾結構
-# ============================================
+# --------------------------------------------
 echo ""
 echo "[3/7] 建立資料夾結構..."
 mkdir -p "${PROJECT_NAME}/modules"
+echo "  → ${PROJECT_NAME}/ 建立完成"
 
-# ============================================
+# --------------------------------------------
 # 步驟 4: 建立 GCS bucket
-# ============================================
+# --------------------------------------------
 echo ""
 echo "[4/7] 檢查 / 建立 GCS bucket: ${BUCKET_NAME}..."
 
 if gsutil ls -b "gs://${BUCKET_NAME}" &>/dev/null; then
-  echo "  → Bucket 已存在,略過"
+  echo "  → Bucket 已存在,略過建立"
 else
   gsutil mb -p "${GCP_PROJECT_ID}" -l "${REGION}" "gs://${BUCKET_NAME}"
   gsutil versioning set on "gs://${BUCKET_NAME}"
-  echo "  → Bucket 建立完成"
+  echo "  → Bucket 建立完成,已啟用版本控制"
 fi
 
-# ============================================
+# --------------------------------------------
 # 步驟 5: 產生 Terraform 檔案
-# ============================================
+# --------------------------------------------
 echo ""
 echo "[5/7] 產生 Terraform 檔案..."
 
@@ -154,6 +244,7 @@ EOF
 
 cat > "${PROJECT_NAME}/main.tf" <<EOF
 # ${PROJECT_NAME} 主要資源定義
+#
 # module "cicd_app" {
 #   source     = "../modules/cicd-app"
 #   project_id = var.project_id
@@ -164,13 +255,15 @@ EOF
 
 cat > "${PROJECT_NAME}/variables.tf" <<EOF
 variable "project_id" {
-  type    = string
-  default = "${GCP_PROJECT_ID}"
+  description = "GCP project ID"
+  type        = string
+  default     = "${GCP_PROJECT_ID}"
 }
 
 variable "region" {
-  type    = string
-  default = "${REGION}"
+  description = "部署區域"
+  type        = string
+  default     = "${REGION}"
 }
 EOF
 
@@ -180,21 +273,26 @@ cat > "${PROJECT_NAME}/outputs.tf" <<EOF
 # }
 EOF
 
-# ============================================
-# 步驟 6: 建立 Plan Trigger
-# ============================================
-echo ""
-echo "[6/7] 建立 Plan Trigger..."
+echo "  → Terraform 檔案產生完成"
 
-if gcloud builds triggers describe "${PROJECT_NAME}-plan" --region="${REGION}" --project="${GCP_PROJECT_ID}" &>/dev/null; then
-  echo "  → Trigger 已存在,略過"
+# --------------------------------------------
+# 步驟 6: 建立 Plan Trigger
+# --------------------------------------------
+echo ""
+echo "[6/7] 建立 Cloud Build Plan Trigger..."
+
+if gcloud builds triggers describe "${PROJECT_NAME}-plan" \
+    --region="${REGION}" \
+    --project="${GCP_PROJECT_ID}" &>/dev/null; then
+  echo "  → Trigger ${PROJECT_NAME}-plan 已存在,略過建立"
 else
-  gcloud builds triggers create pull-request \
+  gcloud builds triggers create github \
     --name="${PROJECT_NAME}-plan" \
     --region="${REGION}" \
     --project="${GCP_PROJECT_ID}" \
     --repository="${REPOSITORY_ID}" \
     --pull-request-pattern="^main$" \
+    --comment-control="COMMENTS_ENABLED" \
     --build-config="cloudbuild-plan.yaml" \
     --service-account="projects/${GCP_PROJECT_ID}/serviceAccounts/${SA_EMAIL}" \
     --included-files="${PROJECT_NAME}/**" \
@@ -202,16 +300,18 @@ else
   echo "  → Plan trigger 建立完成"
 fi
 
-# ============================================
+# --------------------------------------------
 # 步驟 7: 建立 Apply Trigger
-# ============================================
+# --------------------------------------------
 echo ""
-echo "[7/7] 建立 Apply Trigger..."
+echo "[7/7] 建立 Cloud Build Apply Trigger..."
 
-if gcloud builds triggers describe "${PROJECT_NAME}-apply" --region="${REGION}" --project="${GCP_PROJECT_ID}" &>/dev/null; then
-  echo "  → Trigger 已存在,略過"
+if gcloud builds triggers describe "${PROJECT_NAME}-apply" \
+    --region="${REGION}" \
+    --project="${GCP_PROJECT_ID}" &>/dev/null; then
+  echo "  → Trigger ${PROJECT_NAME}-apply 已存在,略過建立"
 else
-  gcloud builds triggers create push \
+  gcloud builds triggers create github \
     --name="${PROJECT_NAME}-apply" \
     --region="${REGION}" \
     --project="${GCP_PROJECT_ID}" \
@@ -222,18 +322,29 @@ else
     --included-files="${PROJECT_NAME}/**" \
     --substitutions="_TF_DIR=${PROJECT_NAME}" \
     --require-approval
-  echo "  → Apply trigger 建立完成(需人工核准)"
+  echo "  → Apply trigger 建立完成(需人工核准才會執行 apply)"
 fi
 
+# --------------------------------------------
+# 完成
+# --------------------------------------------
 echo ""
 echo "=========================================="
-echo "完成!"
-echo "  ${PROJECT_NAME}/ 已建立"
-echo "  Plan trigger : ${PROJECT_NAME}-plan"
-echo "  Apply trigger: ${PROJECT_NAME}-apply"
+echo "完成! 已建立:"
+echo "  ${PROJECT_NAME}/"
+echo "  ├── backend.tf"
+echo "  ├── provider.tf"
+echo "  ├── main.tf"
+echo "  ├── variables.tf"
+echo "  ├── outputs.tf"
+echo "  └── modules/"
+echo ""
+echo "  Trigger: ${PROJECT_NAME}-plan  (PR 觸發)"
+echo "  Trigger: ${PROJECT_NAME}-apply (merge 後觸發,需人工核准)"
 echo "=========================================="
 echo ""
 echo "接下來:"
 echo "  1. git add ${PROJECT_NAME}/ && git commit -m 'init ${PROJECT_NAME}'"
-echo "  2. git push,開一個 PR 測試 plan trigger"
-echo "  3. merge 後到 Console 核准 apply"
+echo "  2. git push,開一個 PR 測試 plan trigger 是否正常執行"
+echo "  3. merge 後,到 Cloud Build Console 核准 apply trigger"
+echo ""

@@ -1,10 +1,10 @@
 # atlas-p6 主要資源定義
-# 在這裡呼叫 modules,例如:
 #
-# module "cicd_app" {
-#   source = "../modules/cicd-app"
-#
-#   project_id = var.project_id
-#   region     = var.region
-#   app_name   = "atlas-p6"
-# }
+# main.tf
+resource "random_pet" "test" {
+  length = 2
+}
+
+output "test_result" {
+  value = "Hello from Terraform! Random pet name: ${random_pet.test.id}"
+}
