@@ -1,0 +1,15 @@
+steps:
+  - name: hashicorp/terraform:1.9.8
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -e
+        cd ${_TF_DIR}
+        terraform fmt -recursive -check
+        terraform init -input=false
+        terraform validate
+        terraform plan -input=false -var="project_id=$PROJECT_ID"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
