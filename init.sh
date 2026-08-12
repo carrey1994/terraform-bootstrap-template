@@ -64,10 +64,10 @@ echo "=========================================="
 # --------------------------------------------
 # 前置檢查
 # --------------------------------------------
-# if [ -d "${PROJECT_NAME}" ]; then
-#   echo "錯誤: 資料夾 ${PROJECT_NAME} 已經存在,請確認後手動處理"
-#   exit 1
-# fi
+if [ -d "${PROJECT_NAME}" ]; then
+  echo "錯誤: 資料夾 ${PROJECT_NAME} 已經存在,請確認後手動處理"
+  exit 1
+fi
 
 if ! command -v gcloud &>/dev/null; then
   echo "錯誤: 找不到 gcloud CLI,請先安裝 Google Cloud SDK"
@@ -245,12 +245,12 @@ EOF
 cat > "${PROJECT_NAME}/main.tf" <<EOF
 # ${PROJECT_NAME} 主要資源定義
 #
-# module "cicd_app" {
-#   source     = "../modules/cicd-app"
-#   project_id = var.project_id
-#   region     = var.region
-#   app_name   = "${PROJECT_NAME}"
+# resource "random_pet" "test" {
+#   length = 2
 # }
+# output "test_result" {
+#   value = "Hello from Terraform! Random pet name: ${random_pet.test.id}"
+# } 
 EOF
 
 cat > "${PROJECT_NAME}/variables.tf" <<EOF
