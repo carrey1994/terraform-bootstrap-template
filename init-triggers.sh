@@ -420,7 +420,10 @@ variable "length" {
 }
 
 module "random" {
-  source = "git::ssh://git@github.com/carrey1994/terraform-modules.git//random?ref=main"
+  # git for development version
+  # source = "git::ssh://git@github.com/carrey1994/terraform-modules.git//random?ref=main"
+  # gcs for release version
+  source = "gcs::https://www.googleapis.com/storage/v1/bucket/random/1.0.0.zip"
   length = var.length
 }
 
